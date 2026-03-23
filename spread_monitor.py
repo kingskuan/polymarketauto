@@ -3,106 +3,125 @@ import time
 import os
 from datetime import datetime
 
-API_BASE = "https://clob.polymarket.com"
+GAMMA_API = "https://gamma-api.polymarket.com"
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
-CHECK_INTERVAL = 1
-SPREAD_THRESHOLD = 1.01
+CHECK_INTERVAL = 30
+SPREAD_THRESHOLD = 0.03
 
 def send_telegram(message):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         return
     try:
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TG_CHAT_ID, "text": message}, timeout=5)
+        requests.post(url, json={"chat_id": TG_CHAT_ID, "text": message}, timeout=10)
     except:
         pass
 
-def get_current_5min_market():
+def get_hot_markets():
     try:
-        url = "https://polymarket.com/api/events/btc-updown-5m"
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            markets = data.get("markets", [])
-            for m in markets:
-                if not m.get("closed", True):
-                    tokens = m.get("clobTokenIds", [])
-                    if tokens:
-                        return {
-                            "question": m.get("question", ""),
-                            "token_yes": tokens[0] if len(tokens) > 0 else None,
-                            "token_no": tokens[1] if len(tokens) > 1 else None
-                        }
-        return None
+        url = f"{GAMMA_API}/markets"
+        params = {
+            "active": "true",
+            "closed": "false",
+            "order": "volume24hr",
+            "ascending": "false",
+            "limit": 50
+        }
+        response = requests.get(url, params=params, timeout=15)
+        markets = response.json()
+        
+        filtered = []
+        skip_keywords = ["vs.", "vs ", "game", "match", "score", "win the", "beat"]
+        
+        for m in markets:
+            question = m.get("question", "").lower()
+            
+            is_sports = any(kw in question for kw in skip_keywords)
+            if is_sports:
+                continue
+            
+            volume_24h = m.get("volume24hr", 0)
+            if volume_24h < 10000:
+                continue
+                
+            filtered.append(m)
+        
+        return filtered[:20]
     except Exception as e:
-        print(f"Error getting market: {e}")
-        return None
+        print(f"Error fetching markets: {e}")
+        return []
 
-def get_orderbook(token_id):
+def calculate_spread(market):
     try:
-        url = f"{API_BASE}/book"
-        params = {"token_id": token_id}
-        response = requests.get(url, params=params, timeout=5)
-        data = response.json()
-        bids = data.get("bids", [])
-        asks = data.get("asks", [])
-        if bids and asks:
-            return float(bids[0]["price"]), float(asks[0]["price"])
-        return None, None
+        prices = eval(market.get("outcomePrices", "[]"))
+        if len(prices) >= 2:
+            yes_price = float(prices[0])
+            no_price = float(prices[1])
+            spread = yes_price + no_price
+            return spread, yes_price, no_price
     except:
-        return None, None
+        pass
+    return None, None, None
 
 def main():
     print("=" * 50)
-    print("Polymarket 5-min BTC Spread Monitor")
-    print(f"Threshold: <= {SPREAD_THRESHOLD}")
-    print(f"Telegram: {'Enabled' if TG_BOT_TOKEN else 'Disabled'}")
+    print("Polymarket Non-Sports Market Monitor")
+    print(f"Spread threshold: {SPREAD_THRESHOLD * 100}%")
+    print(f"Check interval: {CHECK_INTERVAL}s")
     print("=" * 50)
     
-    send_telegram("5-min BTC Monitor Started")
-    
-    check_count = 0
-    low_spread_count = 0
+    send_telegram("Polymarket monitor started - watching non-sports markets")
     
     while True:
         try:
-            market = get_current_5min_market()
+            markets = get_hot_markets()
+            now = datetime.now().strftime("%H:%M:%S")
             
-            if not market:
-                print(f"[{datetime.now()}] No active 5-min market, retry in 10s...")
-                time.sleep(10)
-                continue
+            print(f"\n[{now}] Found {len(markets)} non-sports markets")
+            print("-" * 40)
             
-            yes_bid, yes_ask = get_orderbook(market["token_yes"])
+            opportunities = []
             
-            if yes_bid is None:
-                time.sleep(2)
-                continue
+            for m in markets:
+                spread, yes_price, no_price = calculate_spread(m)
+                if spread is None:
+                    continue
+                
+                question = m.get("question", "")[:50]
+                volume = m.get("volume24hr", 0)
+                spread_pct = (spread - 1) * 100
+                
+                status = "OK" if spread <= (1 + SPREAD_THRESHOLD) else "HIGH"
+                
+                print(f"{status} | spread:{spread:.4f} ({spread_pct:+.2f}%) | vol:${volume:,.0f} | {question}")
+                
+                if spread <= (1 + SPREAD_THRESHOLD):
+                    opportunities.append({
+                        "question": m.get("question", ""),
+                        "spread": spread,
+                        "spread_pct": spread_pct,
+                        "volume": volume,
+                        "yes": yes_price,
+                        "no": no_price,
+                        "slug": m.get("slug", "")
+                    })
             
-            spread = yes_ask - yes_bid
-            total = yes_bid + (1 - yes_ask)
-            
-            check_count += 1
-            
-            if total <= SPREAD_THRESHOLD:
-                low_spread_count += 1
-                msg = f"LOW SPREAD!\n{market['question'][:40]}\nYES: {yes_bid:.3f}/{yes_ask:.3f}\nSpread: {spread:.4f}\nTotal: {total:.4f}"
-                print(f"[{datetime.now()}] {msg}")
+            if opportunities:
+                msg = f"Found {len(opportunities)} low spread markets:\n\n"
+                for opp in opportunities[:5]:
+                    msg += f"- {opp['question'][:40]}\n"
+                    msg += f"  Spread: {opp['spread_pct']:+.2f}% | Vol: ${opp['volume']:,.0f}\n"
+                    msg += f"  YES:{opp['yes']:.3f} NO:{opp['no']:.3f}\n\n"
                 send_telegram(msg)
+                print(f"\nNext check in {CHECK_INTERVAL}s...")
             
-            if check_count % 60 == 0:
-                print(f"[{datetime.now()}] Checks: {check_count} | Low spreads: {low_spread_count}")
-            
-            time.sleep(CHECK_INTERVAL)
-            
-        except KeyboardInterrupt:
-            break
         except Exception as e:
             print(f"Error: {e}")
-            time.sleep(5)
+        
+        time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
     main()
