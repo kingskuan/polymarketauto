@@ -3,13 +3,13 @@ import time
 import os
 from datetime import datetime
 
-GAMMA_API = "https://gamma-api.polymarket.com"
 API_BASE = "https://clob.polymarket.com"
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
-SPREAD_THRESHOLD = 1.02
+CHECK_INTERVAL = 1
+SPREAD_THRESHOLD = 1.01
 
 def send_telegram(message):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
@@ -20,51 +20,89 @@ def send_telegram(message):
     except:
         pass
 
-def get_all_markets():
+def get_current_5min_market():
     try:
-        url = f"{GAMMA_API}/markets"
-        params = {"closed": "false", "limit": 50}
-        response = requests.get(url, params=params, timeout=10)
-        return response.json()
+        url = "https://polymarket.com/api/events/btc-updown-5m"
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            markets = data.get("markets", [])
+            for m in markets:
+                if not m.get("closed", True):
+                    tokens = m.get("clobTokenIds", [])
+                    if tokens:
+                        return {
+                            "question": m.get("question", ""),
+                            "token_yes": tokens[0] if len(tokens) > 0 else None,
+                            "token_no": tokens[1] if len(tokens) > 1 else None
+                        }
+        return None
     except Exception as e:
-        print(f"API error: {e}")
-        return []
+        print(f"Error getting market: {e}")
+        return None
+
+def get_orderbook(token_id):
+    try:
+        url = f"{API_BASE}/book"
+        params = {"token_id": token_id}
+        response = requests.get(url, params=params, timeout=5)
+        data = response.json()
+        bids = data.get("bids", [])
+        asks = data.get("asks", [])
+        if bids and asks:
+            return float(bids[0]["price"]), float(asks[0]["price"])
+        return None, None
+    except:
+        return None, None
 
 def main():
     print("=" * 50)
-    print("Polymarket Market Scanner")
+    print("Polymarket 5-min BTC Spread Monitor")
+    print(f"Threshold: <= {SPREAD_THRESHOLD}")
+    print(f"Telegram: {'Enabled' if TG_BOT_TOKEN else 'Disabled'}")
     print("=" * 50)
-    send_telegram("Polymarket Scanner Started")
     
-    markets = get_all_markets()
-    print(f"Found {len(markets)} markets")
+    send_telegram("5-min BTC Monitor Started")
     
-    btc_markets = []
-    for m in markets:
-        title = m.get("question", "").lower()
-        if "btc" in title or "bitcoin" in title:
-            btc_markets.append(m)
-            print(f"BTC Market: {m.get('question', 'N/A')[:60]}")
+    check_count = 0
+    low_spread_count = 0
     
-    print(f"\nTotal BTC markets: {len(btc_markets)}")
-    
-    if btc_markets:
-        send_telegram(f"Found {len(btc_markets)} BTC markets")
-        for m in btc_markets[:5]:
-            print(f"\n--- Market ---")
-            print(f"Question: {m.get('question', 'N/A')}")
-            print(f"ID: {m.get('conditionId', 'N/A')}")
-            print(f"Tokens: {m.get('clobTokenIds', [])}")
-    else:
-        send_telegram("No BTC markets found - checking all markets")
-        print("\nAll market titles:")
-        for m in markets[:20]:
-            print(f"- {m.get('question', 'N/A')[:70]}")
-    
-    print("\nKeeping alive...")
     while True:
-        time.sleep(300)
-        print(f"[{datetime.now()}] Still running")
+        try:
+            market = get_current_5min_market()
+            
+            if not market:
+                print(f"[{datetime.now()}] No active 5-min market, retry in 10s...")
+                time.sleep(10)
+                continue
+            
+            yes_bid, yes_ask = get_orderbook(market["token_yes"])
+            
+            if yes_bid is None:
+                time.sleep(2)
+                continue
+            
+            spread = yes_ask - yes_bid
+            total = yes_bid + (1 - yes_ask)
+            
+            check_count += 1
+            
+            if total <= SPREAD_THRESHOLD:
+                low_spread_count += 1
+                msg = f"LOW SPREAD!\n{market['question'][:40]}\nYES: {yes_bid:.3f}/{yes_ask:.3f}\nSpread: {spread:.4f}\nTotal: {total:.4f}"
+                print(f"[{datetime.now()}] {msg}")
+                send_telegram(msg)
+            
+            if check_count % 60 == 0:
+                print(f"[{datetime.now()}] Checks: {check_count} | Low spreads: {low_spread_count}")
+            
+            time.sleep(CHECK_INTERVAL)
+            
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            print(f"Error: {e}")
+            time.sleep(5)
 
 if __name__ == "__main__":
     main()
